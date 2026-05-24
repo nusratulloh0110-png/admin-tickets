@@ -1,0 +1,51 @@
+display_information:
+  name: Tickets Admin
+features:
+  bot_user:
+    display_name: Tickets Admin
+    always_online: false
+  slash_commands:
+    - command: /ticket
+      url: https://YOUR_WORKER_SUBDOMAIN.workers.dev
+      description: Создать тикет для админки
+      usage_hint: ""
+      should_escape: false
+    - command: /support
+      url: https://YOUR_WORKER_SUBDOMAIN.workers.dev
+      description: Создать тикет для лида техподдержки
+      usage_hint: ""
+      should_escape: false
+    - command: /report
+      url: https://YOUR_WORKER_SUBDOMAIN.workers.dev
+      description: Показать статистику по тикетам
+      usage_hint: "05.05.2026 06.05.2026 или @admin 05.05.2026 06.05.2026"
+      should_escape: false
+    - command: /support-report
+      url: https://YOUR_WORKER_SUBDOMAIN.workers.dev
+      description: Показать статистику по тикетам техподдержки
+      usage_hint: "05.05.2026 06.05.2026 или @admin 05.05.2026 06.05.2026"
+      should_escape: false
+    - command: /add
+      url: https://YOUR_WORKER_SUBDOMAIN.workers.dev
+      description: Добавить выполненные вне Slack задачи
+      usage_hint: ""
+      should_escape: false
+  shortcuts:
+    - name: Создать тикет
+      type: global
+      callback_id: ticket_create_shortcut
+      description: Открывает форму создания заявки
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - commands
+      - files:read
+settings:
+  interactivity:
+    is_enabled: true
+    request_url: https://YOUR_WORKER_SUBDOMAIN.workers.dev
+    message_menu_options_url: https://YOUR_WORKER_SUBDOMAIN.workers.dev
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
