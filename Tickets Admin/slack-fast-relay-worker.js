@@ -13,7 +13,6 @@
  * Optional:
  * - APPS_SCRIPT_RELAY_SECRET
  * - ADMIN_USER_IDS: comma/space-separated Slack user IDs allowed to use /add before the modal opens
- * - TICKET_TYPE_OPTIONS: optional comma/newline-separated fallback ticket types
  */
 
 const CALLBACKS = {
@@ -48,16 +47,9 @@ const ACTIONS = {
   rejectReason: 'reject_reason_input',
 };
 
-const DEFAULT_TICKET_TYPES = [
-  'Добавить анализ',
-  'Добавить реф значение',
-  'Включить склад 2.0',
-  'Включить ЛИС',
-  'Связка клиник',
-  'Другое',
-];
-
 const TICKET_TYPES_CACHE_TTL_MS = 60 * 1000;
+const TICKET_TYPES_BACKGROUND_REFRESH_TIMEOUT_MS = 10 * 1000;
+const TICKET_TYPES_SLACK_OPTIONS_TIMEOUT_MS = 2700;
 const TICKET_CONTEXTS = {
   admin: 'admin',
   support: 'support',
@@ -90,7 +82,7 @@ export default {
 
     if (slackRequest.kind === 'slash_command') {
       if (slackRequest.command === '/ticket') {
-        ctx.waitUntil(refreshTicketTypeOptions_(env, 2500).catch((error) => console.error(error)));
+        ctx.waitUntil(refreshTicketTypeOptions_(env, TICKET_TYPES_BACKGROUND_REFRESH_TIMEOUT_MS).catch((error) => console.error(error)));
         ctx.waitUntil(openTicketModal_(env, slackRequest.triggerId));
 
         return jsonResponse_({
@@ -177,7 +169,7 @@ export default {
     }
 
     if (payload.type === 'shortcut' && payload.callback_id === CALLBACKS.shortcut) {
-      ctx.waitUntil(refreshTicketTypeOptions_(env, 2500).catch((error) => console.error(error)));
+      ctx.waitUntil(refreshTicketTypeOptions_(env, TICKET_TYPES_BACKGROUND_REFRESH_TIMEOUT_MS).catch((error) => console.error(error)));
       ctx.waitUntil(openTicketModal_(env, payload.trigger_id));
       return jsonResponse_({});
     }
@@ -505,7 +497,7 @@ async function handleTicketTypeCacheRequest_(request, env) {
 
     return jsonResponse_({
       ok: true,
-      options: cached ? cached.options : fallbackTicketTypeOptions_(''),
+      options: cached ? cached.options : [],
       cached: Boolean(cached),
       expiresAt: cached ? cached.expiresAt : 0,
     });
@@ -519,7 +511,15 @@ async function handleTicketTypeCacheRequest_(request, env) {
   }
 
   const body = await request.json().catch(() => ({}));
-  const options = normalizeTicketTypeOptions_(body.options);
+
+  if (!Array.isArray(body.options)) {
+    return jsonResponse_({
+      ok: false,
+      error: 'invalid_ticket_type_options',
+    }, 400);
+  }
+
+  const options = parseTicketTypeOptions_(body.options);
 
   await writeTicketTypeOptionsToCache_(options);
 
@@ -531,48 +531,71 @@ async function handleTicketTypeCacheRequest_(request, env) {
 
 async function ticketTypeOptionsResponse_(env, payload, ctx) {
   const cached = await getFastTicketTypeOptions_();
+  const query = payload.value || '';
 
-  if (cached && cached.options.length) {
-    if (cached.isStale && ctx) {
-      ctx.waitUntil(refreshTicketTypeOptions_(env, 2500).catch((refreshError) => console.error(refreshError)));
+  if (cached && Array.isArray(cached.options)) {
+    const cachedOptions = filterTicketTypeOptions_(cached.options, query);
+
+    if (cachedOptions.length || (!query && cached.options.length)) {
+      if (ctx) {
+        ctx.waitUntil(refreshTicketTypeOptions_(env, TICKET_TYPES_BACKGROUND_REFRESH_TIMEOUT_MS).catch((refreshError) => console.error(refreshError)));
+      }
+
+      return {
+        options: cachedOptions,
+      };
     }
 
-    return {
-      options: filterTicketTypeOptions_(cached.options, payload.value || ''),
-    };
+    // Empty caches are valid, but a synchronous refresh avoids sticky "No results"
+    // after a fresh deploy or a missed edit trigger.
+    try {
+      const options = await refreshTicketTypeOptions_(env, TICKET_TYPES_SLACK_OPTIONS_TIMEOUT_MS);
+
+      return {
+        options: filterTicketTypeOptions_(options, query),
+      };
+    } catch (error) {
+      console.error(error);
+
+      if (ctx) {
+        ctx.waitUntil(refreshTicketTypeOptions_(env, TICKET_TYPES_BACKGROUND_REFRESH_TIMEOUT_MS).catch((refreshError) => console.error(refreshError)));
+      }
+
+      return {
+        options: cachedOptions,
+      };
+    }
   }
 
   try {
-    const options = await refreshTicketTypeOptions_(env, 2400);
+    const options = await refreshTicketTypeOptions_(env, TICKET_TYPES_SLACK_OPTIONS_TIMEOUT_MS);
+
     return {
-      options: filterTicketTypeOptions_(options, payload.value || ''),
+      options: filterTicketTypeOptions_(options, query),
     };
   } catch (error) {
-    const fallbackOptions = configuredFallbackTicketTypeOptions_(env);
+    console.error(error);
 
     if (ctx) {
-      ctx.waitUntil(refreshTicketTypeOptions_(env, 2500).catch((refreshError) => console.error(refreshError)));
+      ctx.waitUntil(refreshTicketTypeOptions_(env, TICKET_TYPES_BACKGROUND_REFRESH_TIMEOUT_MS).catch((refreshError) => console.error(refreshError)));
     }
 
     return {
-      options: filterTicketTypeOptions_(fallbackOptions, payload.value || ''),
+      options: [],
     };
   }
 }
 
 async function getFastTicketTypeOptions_() {
-  const now = Date.now();
-
-  if (ticketTypesCache.options && ticketTypesCache.options.length) {
+  if (Array.isArray(ticketTypesCache.options)) {
     return {
       options: ticketTypesCache.options,
-      isStale: ticketTypesCache.expiresAt <= now,
     };
   }
 
   const cached = await readTicketTypeOptionsFromCache_();
 
-  if (!cached || !cached.options.length) {
+  if (!cached || !Array.isArray(cached.options)) {
     return null;
   }
 
@@ -583,7 +606,6 @@ async function getFastTicketTypeOptions_() {
 
   return {
     options: cached.options,
-    isStale: cached.expiresAt <= now,
   };
 }
 
@@ -593,7 +615,12 @@ async function refreshTicketTypeOptions_(env, timeoutMs) {
     action_id: ACTIONS.type,
     value: '',
   }, timeoutMs || 2600);
-  const options = normalizeTicketTypeOptions_(response.options);
+
+  if (!Array.isArray(response.options)) {
+    throw new Error(`Apps Script returned invalid ticket type options: ${JSON.stringify(response).slice(0, 500)}`);
+  }
+
+  const options = parseTicketTypeOptions_(response.options);
 
   await writeTicketTypeOptionsToCache_(options);
 
@@ -602,7 +629,7 @@ async function refreshTicketTypeOptions_(env, timeoutMs) {
 
 async function readTicketTypeOptionsFromCache_() {
   if (typeof caches === 'undefined' || !caches.default) {
-    return ticketTypesCache.options ? {
+    return Array.isArray(ticketTypesCache.options) ? {
       expiresAt: ticketTypesCache.expiresAt,
       options: ticketTypesCache.options,
     } : null;
@@ -615,20 +642,23 @@ async function readTicketTypeOptionsFromCache_() {
   }
 
   const payload = await response.json().catch(() => null);
-  const options = payload ? normalizeTicketTypeOptions_(payload.options) : [];
 
-  if (!options.length) {
+  if (!payload || !Array.isArray(payload.options)) {
     return null;
   }
 
   return {
     expiresAt: Number(payload.expiresAt) || 0,
-    options,
+    options: parseTicketTypeOptions_(payload.options),
   };
 }
 
 async function writeTicketTypeOptionsToCache_(options) {
-  const normalizedOptions = normalizeTicketTypeOptions_(options);
+  if (!Array.isArray(options)) {
+    throw new Error('Ticket type cache update received invalid options.');
+  }
+
+  const normalizedOptions = parseTicketTypeOptions_(options);
   const expiresAt = Date.now() + TICKET_TYPES_CACHE_TTL_MS;
 
   ticketTypesCache = {
@@ -657,9 +687,9 @@ function ticketTypeCacheRequest_() {
   });
 }
 
-function normalizeTicketTypeOptions_(options) {
+function parseTicketTypeOptions_(options) {
   if (!Array.isArray(options) || !options.length) {
-    return DEFAULT_TICKET_TYPES.map(ticketTypeOption_);
+    return [];
   }
 
   return options
@@ -669,21 +699,6 @@ function normalizeTicketTypeOptions_(options) {
     })
     .filter(Boolean)
     .slice(0, 100);
-}
-
-function fallbackTicketTypeOptions_(query) {
-  return filterTicketTypeOptions_(configuredFallbackTicketTypeOptions_({}), query);
-}
-
-function configuredFallbackTicketTypeOptions_(env) {
-  const configuredTypes = String(env.TICKET_TYPE_OPTIONS || '')
-    .split(/[\n,]+/)
-    .map((type) => type.trim())
-    .filter(Boolean);
-
-  const types = configuredTypes.length ? configuredTypes : DEFAULT_TICKET_TYPES;
-
-  return types.map(ticketTypeOption_);
 }
 
 function filterTicketTypeOptions_(options, query) {

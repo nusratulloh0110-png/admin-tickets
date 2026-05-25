@@ -1115,8 +1115,7 @@ function sendTicketRemindersForContext_(context) {
 }
 
 function randomActiveAdminId_(context) {
-  const activeIds = getActiveAdminIds_(context);
-  const ids = activeIds.length ? activeIds : getAdminIdsFromProperties_(context);
+  const ids = getActiveAdminIds_(context);
 
   if (!ids.length) {
     return '';
@@ -1405,7 +1404,7 @@ function getTicketTypes_() {
   const sheet = ensureTicketTypesSheet_();
 
   if (sheet.getLastRow() < 2) {
-    return DEFAULT_TICKET_TYPES.slice();
+    return [];
   }
 
   const headerMap = getHeaderMap_(sheet);
@@ -1428,7 +1427,7 @@ function getTicketTypes_() {
       return type.name;
     });
 
-  return types.length ? types : DEFAULT_TICKET_TYPES.slice();
+  return types;
 }
 
 function getTicketTypeResponsibleNotice_(ticketType) {
@@ -2264,26 +2263,31 @@ function safeSyncTicketTypesToWorker_() {
   }
 }
 
+function syncTicketTypesToWorker() {
+  return syncTicketTypesToWorker_();
+}
+
 function syncTicketTypesToWorker_() {
   const workerUrl = normalizeText_(getProperty_(CONFIG.WORKER_URL, ''));
 
   if (!workerUrl) {
-    return;
+    return 'WORKER_URL не задан. Кэш типов заявок в Worker не обновлен.';
   }
 
   const relaySecret = getProperty_(CONFIG.RELAY_SHARED_SECRET, '');
 
   if (!relaySecret) {
     console.error('WORKER_URL задан, но RELAY_SHARED_SECRET пустой. Кэш типов заявок в Worker не обновлен.');
-    return;
+    return 'WORKER_URL задан, но RELAY_SHARED_SECRET пустой. Кэш типов заявок в Worker не обновлен.';
   }
 
   const url = workerUrl.replace(/\/+$/, '') + '/ticket-types/cache?relay_secret=' + encodeURIComponent(relaySecret);
+  const options = getTicketTypeOptions_('');
   const response = UrlFetchApp.fetch(url, {
     method: 'post',
     contentType: 'application/json; charset=utf-8',
     payload: JSON.stringify({
-      options: getTicketTypeOptions_(''),
+      options,
     }),
     muteHttpExceptions: true,
   });
@@ -2291,6 +2295,8 @@ function syncTicketTypesToWorker_() {
   if (response.getResponseCode() >= 300) {
     throw new Error('Не удалось обновить кэш типов заявок в Worker: ' + response.getContentText());
   }
+
+  return 'Кэш типов заявок в Worker обновлен: ' + options.length + '.';
 }
 
 function resetQueueTrigger_(handlerName) {
@@ -4721,36 +4727,25 @@ function isAdmin_(userId, context) {
     return false;
   }
 
-  const sheetAdminIds = getActiveAdminIds_(context);
+  const adminAccess = readAdminAccessFromSheet_(normalizeTicketContext_(context));
+  const allowedIds = adminAccess.hasSheetAdmins ? adminAccess.activeIds : getAdminIdsFromProperties_(context);
 
-  if (sheetAdminIds.length) {
-    return sheetAdminIds.indexOf(normalizedUserId) !== -1;
-  }
-
-  return getAdminIdsFromProperties_(context).indexOf(normalizedUserId) !== -1;
+  return allowedIds.indexOf(normalizedUserId) !== -1;
 }
 
 function getActiveAdminIds_(context) {
-  const ticketContext = normalizeTicketContext_(context);
-  const cache = CacheService.getScriptCache();
-  const cacheKey = 'ACTIVE_ADMIN_IDS_' + ticketContext;
-  const cached = cache.get(cacheKey);
-
-  if (cached) {
-    return JSON.parse(cached);
-  }
-
-  const ids = readActiveAdminIdsFromSheet_(ticketContext);
-  cache.put(cacheKey, JSON.stringify(ids), 60);
-
-  return ids;
+  const adminAccess = readAdminAccessFromSheet_(normalizeTicketContext_(context));
+  return adminAccess.hasSheetAdmins ? adminAccess.activeIds : getAdminIdsFromProperties_(context);
 }
 
-function readActiveAdminIdsFromSheet_(context) {
+function readAdminAccessFromSheet_(context) {
   const sheet = isSupportContext_(context) ? ensureSupportAdminsSheet_() : ensureAdminsSheet_();
 
   if (sheet.getLastRow() < 2) {
-    return [];
+    return {
+      hasSheetAdmins: false,
+      activeIds: [],
+    };
   }
 
   const headerMap = getHeaderMap_(sheet);
@@ -4758,10 +4753,13 @@ function readActiveAdminIdsFromSheet_(context) {
   const activeColumn = headerMap.Active;
 
   if (!idColumn) {
-    return [];
+    return {
+      hasSheetAdmins: false,
+      activeIds: [],
+    };
   }
 
-  return sheet
+  const admins = sheet
     .getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn())
     .getValues()
     .map(function (row) {
@@ -4771,11 +4769,19 @@ function readActiveAdminIdsFromSheet_(context) {
       };
     })
     .filter(function (admin) {
-      return admin.id && isActiveAdminValue_(admin.active);
-    })
-    .map(function (admin) {
       return admin.id;
     });
+
+  return {
+    hasSheetAdmins: admins.length > 0,
+    activeIds: admins
+      .filter(function (admin) {
+        return isActiveAdminValue_(admin.active);
+      })
+      .map(function (admin) {
+        return admin.id;
+      }),
+  };
 }
 
 function getAdminIdsFromProperties_(context) {
