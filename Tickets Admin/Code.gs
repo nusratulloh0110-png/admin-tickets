@@ -18,11 +18,14 @@
  * - DIRECT_MODAL_OPENING: Set to true only if Slack points directly to Apps Script and it is fast enough
  * - REPORT_CUTOFF_AT: First date/time included in reports; setup() sets it once during this update
  * - WORKER_URL: Optional Cloudflare Worker URL used to pre-cache ticket types for fast Slack dropdowns
+ * - OVER_MODERATOR_USER_ID: Slack user ID allowed to close tickets with /over
  *
  * Slack bot scopes:
  * - chat:write
  * - commands
  * - files:read
+ * - channels:history (only needed for repairMissingTicketsFromSlack...)
+ * - groups:history (only needed if the ticket channel is private)
  */
 
 const CONFIG = {
@@ -40,6 +43,7 @@ const CONFIG = {
   DIRECT_MODAL_OPENING: 'DIRECT_MODAL_OPENING',
   REPORT_CUTOFF_AT: 'REPORT_CUTOFF_AT',
   WORKER_URL: 'WORKER_URL',
+  OVER_MODERATOR_USER_ID: 'OVER_MODERATOR_USER_ID',
 };
 
 const CALLBACKS = {
@@ -296,6 +300,28 @@ function setup() {
   return 'Готово. Основная таблица: ' + spreadsheet.getUrl() + '\nТехподдержка: ' + supportSpreadsheet.getUrl();
 }
 
+function repairMissingTicketsFromSlackToday() {
+  return repairMissingTicketsFromSlackSince();
+}
+
+function repairMissingTicketsFromSlackLast7Days() {
+  return repairMissingTicketsFromSlackSince(daysAgo_(7));
+}
+
+function repairMissingTicketsFromSlackSince(dateText) {
+  const since = dateText ? parseRepairStartDate_(dateText) : startOfToday_();
+  return repairMissingTicketsFromSlackSince_(since, TICKET_CONTEXTS.admin);
+}
+
+function repairMissingSupportTicketsFromSlackToday() {
+  return repairMissingSupportTicketsFromSlackSince();
+}
+
+function repairMissingSupportTicketsFromSlackSince(dateText) {
+  const since = dateText ? parseRepairStartDate_(dateText) : startOfToday_();
+  return repairMissingTicketsFromSlackSince_(since, TICKET_CONTEXTS.support);
+}
+
 function normalizeTicketContext_(context) {
   return context === TICKET_CONTEXTS.support ? TICKET_CONTEXTS.support : TICKET_CONTEXTS.admin;
 }
@@ -352,10 +378,25 @@ function reportChannelId_(context) {
 }
 
 function ticketReportTitle_(context, baseTitle) {
-  return isSupportContext_(context) ? baseTitle + ' техподдержки' : baseTitle;
+  return isSupportContext_(context) ? baseTitle + ' Tech Support Lead' : baseTitle;
 }
 
 function handleSlashCommand_(request) {
+  if (request.command === '/over') {
+    handleOverCommand_({
+      type: 'over_command',
+      command: request.command,
+      text: request.text,
+      user_id: request.userId,
+      user_name: request.userName,
+      channel_id: request.channelId,
+      response_url: request.responseUrl,
+      thread_ts: request.threadTs,
+    });
+
+    return jsonOutput_({});
+  }
+
   if (request.command === '/support') {
     if (!shouldOpenModalDirectly_()) {
       return jsonOutput_({
@@ -368,7 +409,7 @@ function handleSlashCommand_(request) {
 
     return jsonOutput_({
       response_type: 'ephemeral',
-      text: 'Открываю форму создания тикета техподдержки.',
+      text: 'Открываю форму создания тикета Tech Support Lead.',
     });
   }
 
@@ -412,7 +453,7 @@ function handleSlashCommand_(request) {
   if (request.command && request.command !== '/ticket') {
     return jsonOutput_({
       response_type: 'ephemeral',
-      text: 'Эта автоматизация обрабатывает команды /ticket, /support, /add, /report и /support-report.',
+      text: 'Эта автоматизация обрабатывает команды /ticket, /support, /add, /over, /report и /support-report.',
     });
   }
 
@@ -464,6 +505,11 @@ function handleSlackPayload_(payload) {
 
   if (payload.type === 'support_report_command') {
     handleReportCommand_(payload, TICKET_CONTEXTS.support);
+    return jsonOutput_({});
+  }
+
+  if (payload.type === 'over_command') {
+    handleOverCommand_(payload);
     return jsonOutput_({});
   }
 
@@ -808,7 +854,7 @@ function assigneeOnlyWarning_(assigneeId, context) {
     return 'Этот тикет еще не закреплен за исполнителем. Сначала нужно взять его в работу.';
   }
 
-  const role = isSupportContext_(context) ? 'тех саппорт лид' : 'администратор';
+  const role = isSupportContext_(context) ? 'Tech Support Lead' : 'администратор';
   return 'Этот тикет взял в работу <@' + assigneeId + '>. Завершить или отклонить его может только этот ' + role + '.';
 }
 
@@ -932,6 +978,10 @@ function processQueuedTicket_(item) {
       files: existing.files && existing.files.length ? existing.files : ticket.files,
     });
   } catch (error) {
+    if (!isTicketNotFoundError_(error)) {
+      throw error;
+    }
+
     record = appendTicket_(ticket);
     createdNow = true;
   }
@@ -1036,6 +1086,205 @@ function handleReportCommand_(payload, context) {
   respondToSlashCommand_(payload.response_url, reportSlackMessage_(report, 'ephemeral'));
 }
 
+function handleOverCommand_(payload) {
+  const moderatorId = normalizeText_(payload.user_id);
+  const moderatorName = normalizeText_(payload.user_name) || moderatorId;
+
+  if (!isOverModerator_(moderatorId)) {
+    respondToSlashCommand_(payload.response_url, {
+      response_type: 'ephemeral',
+      text: 'У вас нет прав на /over. Команду может использовать только назначенный модератор.',
+    });
+    return;
+  }
+
+  const parsed = parseOverCommand_(payload);
+
+  if (parsed.error) {
+    respondToSlashCommand_(payload.response_url, {
+      response_type: 'ephemeral',
+      text: parsed.error,
+    });
+    return;
+  }
+
+  let result;
+
+  try {
+    result = closeTicketByModerator_(parsed.ticketId, moderatorId, moderatorName, parsed.context, parsed.assignee);
+  } catch (error) {
+    respondToSlashCommand_(payload.response_url, {
+      response_type: 'ephemeral',
+      text: 'Не удалось закрыть тикет: ' + friendlyError_(error),
+    });
+    return;
+  }
+
+  if (result.warning) {
+    respondToSlashCommand_(payload.response_url, {
+      response_type: 'ephemeral',
+      text: result.warning,
+    });
+    return;
+  }
+
+  try {
+    const authorPrefix = result.ticket.authorId ? '<@' + result.ticket.authorId + '> ' : '';
+    const assigneeText = result.ticket.assigneeId ? ' Исполнитель: <@' + result.ticket.assigneeId + '>.' : '';
+    updateTicketMessage_({}, result.ticket);
+    postThreadNotice_(
+      {},
+      result.ticket,
+      authorPrefix + 'тикет ' + result.ticket.id + ' закрыт модератором <@' + moderatorId + '>.' + assigneeText
+    );
+  } catch (error) {
+    safeAppendEvent_(result.ticket.id, 'Moderator Close Slack Update Failed', moderatorId, result.ticket.status, friendlyError_(error), result.ticket.context);
+    respondToSlashCommand_(payload.response_url, {
+      response_type: 'ephemeral',
+      text: 'Тикет ' + result.ticket.id + ' закрыт, но Slack-карточку/тред обновить не удалось: ' + friendlyError_(error),
+    });
+    return;
+  }
+
+  respondToSlashCommand_(payload.response_url, {
+    response_type: 'ephemeral',
+    text: 'Тикет ' + result.ticket.id + ' закрыт модератором.',
+  });
+}
+
+function parseOverCommand_(payload) {
+  const text = payload.text || '';
+  const textTicketId = ticketIdFromText_(text);
+  const assignee = parseOverAssignee_(text);
+
+  if (assignee.error) {
+    return {
+      error: assignee.error,
+    };
+  }
+
+  if (textTicketId) {
+    return {
+      ticketId: textTicketId,
+      context: ticketContextFromId_(textTicketId),
+      assignee,
+    };
+  }
+
+  const threadTs = normalizeText_(payload.thread_ts || payload.threadTs);
+
+  if (threadTs) {
+    const record = getTicketRecordBySlackThread_(payload.channel_id, threadTs);
+
+    if (record) {
+      return {
+        ticketId: record.ticket.id,
+        context: record.ticket.context,
+        assignee,
+      };
+    }
+  }
+
+  return {
+    error: 'Не нашел тикет для закрытия. Используйте `/over T1147`, `/over @user T1147` или вызовите `/over` прямо в треде тикета.',
+  };
+}
+
+function parseOverAssignee_(text) {
+  const value = String(text || '');
+  const mention = value.match(/<@([A-Z0-9]+)(?:\|([^>]+))?>/i);
+
+  if (mention) {
+    return {
+      id: mention[1],
+      name: mention[2] || mention[1],
+      label: '<@' + mention[1] + '>',
+    };
+  }
+
+  const directId = value.match(/\b[UW][A-Z0-9]{6,}\b/i);
+
+  if (directId) {
+    return {
+      id: directId[0].toUpperCase(),
+      name: directId[0].toUpperCase(),
+      label: '<@' + directId[0].toUpperCase() + '>',
+    };
+  }
+
+  const rawMention = value.match(/(^|\s)@([^\s]+)/);
+
+  if (rawMention) {
+    return {
+      error: 'Slack не передал ID пользователя для ' + rawMention[0].trim() + '. Включите Escape users/channels/links для команды /over или используйте Slack ID: `/over U12345678 T1147`.',
+    };
+  }
+
+  return null;
+}
+
+function closeTicketByModerator_(ticketId, moderatorId, moderatorName, context, assigneeOverride) {
+  const now = new Date();
+  const ticketContext = normalizeTicketContext_(context || ticketContextFromId_(ticketId));
+  const overrideAssignee = assigneeOverride && assigneeOverride.id ? assigneeOverride : null;
+
+  getOrRecoverTicketRecordFromSlackHistory_(ticketId, ticketContext);
+
+  return withScriptLock_(function () {
+    const record = getTicketRecord_(ticketId, ticketContext);
+
+    if (record.ticket.status === 'Done') {
+      return {
+        warning: 'Тикет ' + ticketId + ' уже закрыт.',
+      };
+    }
+
+    const acceptedAt = record.ticket.dateAccepted || now;
+    const fields = {
+      Status: 'Done',
+      'Date Completed': now,
+      'Resolution Time': hoursBetween_(acceptedAt, now),
+    };
+
+    if (overrideAssignee) {
+      fields.Assignee = overrideAssignee.id;
+      fields['Assignee Name'] = overrideAssignee.name || overrideAssignee.id;
+    } else if (!record.ticket.assigneeId) {
+      fields.Assignee = moderatorId;
+      fields['Assignee Name'] = moderatorName || moderatorId;
+    }
+
+    if (!record.ticket.dateAccepted) {
+      fields['Date Accepted'] = acceptedAt;
+      fields['Reaction Time'] = hoursBetween_(record.ticket.createdAt, now);
+    }
+
+    updateTicketFields_(record.sheet, record.row, fields);
+    appendEvent_(
+      ticketId,
+      'Moderator Closed',
+      moderatorId,
+      'Done',
+      'Ticket closed with /over' + (overrideAssignee ? '; assignee set to ' + overrideAssignee.id : ''),
+      ticketContext
+    );
+
+    return {
+      ticket: getTicketRecord_(ticketId, ticketContext).ticket,
+    };
+  });
+}
+
+function isOverModerator_(userId) {
+  const allowedId = normalizeText_(getProperty_(CONFIG.OVER_MODERATOR_USER_ID, '')).toUpperCase();
+
+  if (!allowedId) {
+    return false;
+  }
+
+  return normalizeText_(userId).toUpperCase() === allowedId;
+}
+
 function sendWeeklyReport() {
   const range = previousWeekRange_(new Date());
   const report = buildReport_(range.startDate, range.endDate, null, 'Еженедельный отчет по тикетам', TICKET_CONTEXTS.admin);
@@ -1045,7 +1294,7 @@ function sendWeeklyReport() {
   postReportToChannel_(report);
 
   if (getProperty_(CONFIG.SLACK_SUPPORT_CHANNEL_ID, '')) {
-    const supportReport = buildReport_(range.startDate, range.endDate, null, 'Еженедельный отчет по тикетам техподдержки', TICKET_CONTEXTS.support);
+    const supportReport = buildReport_(range.startDate, range.endDate, null, 'Еженедельный отчет по тикетам Tech Support Lead', TICKET_CONTEXTS.support);
     writeReportSheet_(supportReport);
     postReportToChannel_(supportReport);
   }
@@ -1076,6 +1325,10 @@ function sendTicketRemindersForContext_(context) {
     let ticket = null;
 
     try {
+      if (!getCell_(row, headerMap, 'Ticket ID')) {
+        return;
+      }
+
       ticket = ticketFromRow_(row, headerMap, ticketContext);
 
       if (ticket.status === 'New' && !ticket.unacceptedReminderSent && hoursBetween_(ticket.createdAt, now) >= 72) {
@@ -1085,7 +1338,7 @@ function sendTicketRemindersForContext_(context) {
           return;
         }
 
-        postTicketReminder_(ticket, '<@' + adminId + '>, тикет ' + ticket.id + ' не взят в работу больше 3 дней. Пожалуйста, проверьте заявку и возьмите ее в работу или передайте ответственному ' + (isSupportContext_(ticketContext) ? 'тех саппорт лиду' : 'администратору') + '.');
+        postTicketReminder_(ticket, '<@' + adminId + '>, тикет ' + ticket.id + ' не взят в работу больше 3 дней. Пожалуйста, проверьте заявку и возьмите ее в работу или передайте ответственному ' + (isSupportContext_(ticketContext) ? 'Tech Support Lead' : 'администратору') + '.');
         updateTicketFields_(sheet, sheetRow, {
           'Unaccepted Reminder Sent': now,
         });
@@ -1133,7 +1386,7 @@ function refreshReportsSheet_() {
 
 function refreshSupportReportsSheet_() {
   const range = currentMonthRange_(new Date());
-  const report = buildReport_(range.startDate, range.endDate, null, 'Отчет по тикетам техподдержки за текущий месяц', TICKET_CONTEXTS.support);
+  const report = buildReport_(range.startDate, range.endDate, null, 'Отчет по тикетам Tech Support Lead за текущий месяц', TICKET_CONTEXTS.support);
   writeReportSheet_(report);
 }
 
@@ -1248,9 +1501,9 @@ function buildReport_(startDate, endDate, admin, title, context) {
   const rejectedTickets = filteredTickets.filter(function (ticket) {
     return ticket.status === 'Rejected' && dateInRange_(ticket.dateCompleted, startDate, endDate);
   });
-  const inProgressCount = filteredTickets.filter(function (ticket) {
+  const inProgressTickets = filteredTickets.filter(function (ticket) {
     return ticket.status === 'In Progress';
-  }).length;
+  });
   const resolutionHours = completedTickets
     .map(function (ticket) {
       return ticketResolutionTimeHours_(ticket);
@@ -1282,7 +1535,7 @@ function buildReport_(startDate, endDate, admin, title, context) {
       accepted: acceptedTickets.length,
       completed: completedTickets.length,
       rejected: rejectedTickets.length,
-      inProgress: inProgressCount,
+      inProgress: inProgressTickets.length,
       avgResolutionHours: average_(resolutionHours),
       totalResolutionHours: sum_(resolutionHours),
       avgReactionHours: average_(reactionHours),
@@ -1292,9 +1545,7 @@ function buildReport_(startDate, endDate, admin, title, context) {
     byAdmin: groupTickets_(completedTickets, function (ticket) {
       return ticket.assigneeName || ticket.assigneeId || 'Без исполнителя';
     }),
-    byType: groupTickets_(createdTickets, function (ticket) {
-      return ticket.type || 'Не указано';
-    }),
+    byType: groupTicketTypesWithStatuses_(createdTickets),
     byRegion: groupTickets_(createdTickets, function (ticket) {
       return ticket.region || 'Не указано';
     }),
@@ -1600,6 +1851,45 @@ function groupTickets_(tickets, keyGetter) {
     });
 }
 
+function groupTicketTypesWithStatuses_(tickets) {
+  const groups = {};
+
+  tickets.forEach(function (ticket) {
+    const key = normalizeText_(ticket.type) || 'Не указано';
+
+    if (!groups[key]) {
+      groups[key] = {
+        name: key,
+        count: 0,
+        completed: 0,
+        rejected: 0,
+        inProgress: 0,
+      };
+    }
+
+    const group = groups[key];
+    const status = normalizeTicketStatus_(ticket.status);
+
+    group.count += 1;
+
+    if (status === 'Done') {
+      group.completed += 1;
+    } else if (status === 'Rejected') {
+      group.rejected += 1;
+    } else if (status === 'In Progress') {
+      group.inProgress += 1;
+    }
+  });
+
+  return Object.keys(groups)
+    .map(function (key) {
+      return groups[key];
+    })
+    .sort(function (left, right) {
+      return right.count - left.count || left.name.localeCompare(right.name);
+    });
+}
+
 function groupOutsideTasks_(tasks, keyGetter) {
   const groups = {};
 
@@ -1674,7 +1964,17 @@ function reportSlackMessage_(report, responseType) {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: (isSupportContext_(report.context) ? '*Закрытые тикеты по тех саппорт лидам:*\n' : '*Закрытые тикеты по администраторам:*\n') + formatReportList_(topAdmins),
+        text: (isSupportContext_(report.context) ? '*Закрытые тикеты по Tech Support Lead:*\n' : '*Закрытые тикеты по администраторам:*\n') + formatReportList_(topAdmins),
+      },
+    });
+  }
+
+  if (!isSupportContext_(report.context)) {
+    blocks.push({
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: '*Типы заявок:*\n' + formatReportTypeStatusList_(report.byType.slice(0, 8)),
       },
     });
   }
@@ -1705,6 +2005,28 @@ function formatReportList_(items) {
     .join('\n');
 }
 
+function formatReportTypeStatusList_(items) {
+  if (!items.length) {
+    return 'Нет данных за выбранный период.';
+  }
+
+  return items
+    .map(function (item) {
+      return '• ' +
+        escapeSlack_(item.name) +
+        ': всего *' +
+        item.count +
+        '*, выполнено *' +
+        item.completed +
+        '*, отклонено *' +
+        item.rejected +
+        '*, в работе *' +
+        item.inProgress +
+        '*';
+    })
+    .join('\n');
+}
+
 function formatOutsideTaskList_(tasks, includeEmployee) {
   return tasks
     .map(function (task) {
@@ -1731,7 +2053,7 @@ function reportPlainText_(report) {
 
 function respondToSlashCommand_(responseUrl, payload) {
   if (!responseUrl) {
-    throw new Error('Slack не передал response_url для /report.');
+    throw new Error('Slack не передал response_url для slash-команды.');
   }
 
   const response = UrlFetchApp.fetch(responseUrl, {
@@ -1742,7 +2064,7 @@ function respondToSlashCommand_(responseUrl, payload) {
   });
 
   if (response.getResponseCode() >= 300) {
-    throw new Error('Не удалось отправить ответ /report: ' + response.getContentText());
+    throw new Error('Не удалось отправить ответ slash-команды: ' + response.getContentText());
   }
 }
 
@@ -1810,15 +2132,17 @@ function writeReportSheet_(report) {
   let nextRow = 8;
 
   if (!report.admin) {
-    const tableTitle = isSupportContext_(report.context) ? 'Закрытые тикеты по тех саппорт лидам' : 'Закрытые тикеты по администраторам';
-    const firstColHeader = isSupportContext_(report.context) ? 'Тех саппорт лид' : 'Администратор';
+    const tableTitle = isSupportContext_(report.context) ? 'Закрытые тикеты по Tech Support Lead' : 'Закрытые тикеты по администраторам';
+    const firstColHeader = isSupportContext_(report.context) ? 'Tech Support Lead' : 'Администратор';
     nextRow = writeReportTable_(sheet, nextRow, 1, tableTitle, [firstColHeader, 'Выполнено'], report.byAdmin);
   }
 
   nextRow = Math.max(nextRow, 8);
   if (!isSupportContext_(report.context)) {
-    writeReportTable_(sheet, 8, 4, 'Типы заявок', ['Тип', 'Количество'], report.byType);
-    writeReportTable_(sheet, 8, 7, 'Регионы / ОП', ['Регион / ОП', 'Количество'], report.byRegion);
+    const typeTableNextRow = writeReportTable_(sheet, 8, 4, 'Типы заявок', ['Тип', 'Количество', 'Выполнено', 'Отклонено', 'В работе'], report.byType, function (item) {
+      return [item.name, item.count, item.completed, item.rejected, item.inProgress];
+    });
+    writeReportTable_(sheet, typeTableNextRow + 1, 4, 'Регионы / ОП', ['Регион / ОП', 'Количество'], report.byRegion);
   }
   nextRow = writeReportTable_(sheet, nextRow + 2, 1, 'Статусы созданных тикетов', ['Статус', 'Количество'], report.byStatus);
 
@@ -1829,10 +2153,12 @@ function writeReportSheet_(report) {
   return sheet;
 }
 
-function writeReportTable_(sheet, row, column, title, headers, items) {
+function writeReportTable_(sheet, row, column, title, headers, items, rowMapper) {
   const data = items.length ? items.map(function (item) {
-    return [item.name, item.count];
-  }) : [['Нет данных', 0]];
+    return rowMapper ? rowMapper(item) : [item.name, item.count];
+  }) : [headers.map(function (header, index) {
+    return index === 0 ? 'Нет данных' : 0;
+  })];
   const width = headers.length;
 
   sheet.getRange(row, column, 1, width).merge();
@@ -2356,7 +2682,7 @@ function takeTicket_(payload, ticketId, context) {
   }
 
   const result = withScriptLock_(function () {
-    const record = getTicketRecord_(ticketId, ticketContext);
+    const record = getOrRecoverTicketRecord_(ticketId, ticketContext, payload);
 
     if (record.ticket.status !== 'New') {
       return {
@@ -2389,7 +2715,7 @@ function takeTicket_(payload, ticketId, context) {
   postThreadNotice_(
     payload,
     result.ticket,
-    '<@' + result.ticket.authorId + '> ваша заявка принята в работу ' + (isSupportContext_(ticketContext) ? 'тех саппорт лидом' : 'администратором') + ' <@' + actor.id + '>. Дальнейшее общение ведем в этом треде.'
+    '<@' + result.ticket.authorId + '> ваша заявка принята в работу ' + (isSupportContext_(ticketContext) ? 'Tech Support Lead' : 'администратором') + ' <@' + actor.id + '>. Дальнейшее общение ведем в этом треде.'
   );
 
   return jsonOutput_({});
@@ -2405,7 +2731,7 @@ function completeTicket_(payload, ticketId, context) {
   }
 
   const result = withScriptLock_(function () {
-    const record = getTicketRecord_(ticketId, ticketContext);
+    const record = getOrRecoverTicketRecord_(ticketId, ticketContext, payload);
 
     if (record.ticket.status === 'Done') {
       return { warning: 'Тикет уже закрыт.' };
@@ -2467,7 +2793,7 @@ function rejectTicket_(payload, ticketId, reason, context) {
   }
 
   const result = withScriptLock_(function () {
-    const record = getTicketRecord_(ticketId, ticketContext);
+    const record = getOrRecoverTicketRecord_(ticketId, ticketContext, payload);
 
     if (record.ticket.status === 'Done') {
       return { warning: 'Выполненный тикет нельзя отклонить.' };
@@ -2509,7 +2835,7 @@ function rejectTicket_(payload, ticketId, reason, context) {
   postThreadNotice_(
     payload,
     result.ticket,
-    '<@' + result.ticket.authorId + '> ваша заявка отклонена ' + (isSupportContext_(ticketContext) ? 'тех саппорт лидом' : 'администратором') + ' <@' + actor.id + '>.\n*Причина:* ' + escapeSlack_(rejectionReason)
+    '<@' + result.ticket.authorId + '> ваша заявка отклонена ' + (isSupportContext_(ticketContext) ? 'Tech Support Lead' : 'администратором') + ' <@' + actor.id + '>.\n*Причина:* ' + escapeSlack_(rejectionReason)
   );
 
   return jsonOutput_({});
@@ -2535,9 +2861,11 @@ function parseSlackRequest_(e) {
       command: params.command || '',
       triggerId: params.trigger_id || '',
       userId: params.user_id || '',
+      userName: params.user_name || '',
       channelId: params.channel_id || '',
       text: params.text || '',
       responseUrl: params.response_url || '',
+      threadTs: params.thread_ts || '',
     };
   }
 
@@ -2599,7 +2927,7 @@ function openTicketModal_(triggerId) {
 
 function openSupportTicketModal_(triggerId) {
   if (!triggerId) {
-    throw new Error('Slack не передал trigger_id для открытия формы техподдержки.');
+    throw new Error('Slack не передал trigger_id для открытия формы Tech Support Lead.');
   }
 
   slackApi_('views.open', {
@@ -2753,7 +3081,7 @@ function buildSupportTicketModal_() {
     }),
     title: {
       type: 'plain_text',
-      text: 'Задача техподдержки',
+      text: 'Задача Tech Support Lead',
     },
     submit: {
       type: 'plain_text',
@@ -3666,19 +3994,45 @@ function normalizeTicketStatus_(status) {
 }
 
 function appendTicket_(ticket) {
+  return withScriptLock_(function () {
+    try {
+      return getTicketRecord_(ticket.id, ticket.context);
+    } catch (error) {
+      if (!isTicketNotFoundError_(error)) {
+        throw error;
+      }
+
+      return appendTicketUnlocked_(ticket);
+    }
+  });
+}
+
+function appendTicketUnlocked_(ticket) {
   const sheet = ensureTicketsSheet_(false, ticket.context);
   const headers = getHeaders_(sheet);
   const row = headers.map(function (header) {
     return ticketValueForHeader_(ticket, header);
   });
+  const rowNumber = appendSheetRowUnlocked_(sheet, row);
 
-  sheet.appendRow(row);
+  SpreadsheetApp.flush();
 
   return {
     sheet,
-    row: sheet.getLastRow(),
+    row: rowNumber,
     ticket,
   };
+}
+
+function appendSheetRowUnlocked_(sheet, row) {
+  const rowNumber = sheet.getLastRow() + 1;
+
+  if (sheet.getMaxRows() < rowNumber) {
+    sheet.insertRowsAfter(sheet.getMaxRows(), rowNumber - sheet.getMaxRows());
+  }
+
+  sheet.getRange(rowNumber, 1, 1, row.length).setValues([row]);
+  return rowNumber;
 }
 
 function ticketValueForHeader_(ticket, header) {
@@ -3715,14 +4069,20 @@ function ticketValueForHeader_(ticket, header) {
 }
 
 function getTicketRecord_(ticketId, context) {
+  if (!normalizeText_(ticketId)) {
+    throw ticketNotFoundError_(ticketId);
+  }
+
   const ticketContext = normalizeTicketContext_(context || ticketContextFromId_(ticketId));
   const sheet = ensureTicketsSheet_(false, ticketContext);
   const values = sheet.getDataRange().getValues();
   const headerMap = getHeaderMap_(sheet);
   const idColumnIndex = headerMap['Ticket ID'] - 1;
 
+  const expectedTicketId = normalizeText_(ticketId).toUpperCase();
+
   for (let rowIndex = 1; rowIndex < values.length; rowIndex += 1) {
-    if (String(values[rowIndex][idColumnIndex]) === String(ticketId)) {
+    if (normalizeText_(values[rowIndex][idColumnIndex]).toUpperCase() === expectedTicketId) {
       return {
         sheet,
         row: rowIndex + 1,
@@ -3731,7 +4091,618 @@ function getTicketRecord_(ticketId, context) {
     }
   }
 
-  throw new Error('Тикет ' + ticketId + ' не найден в базе.');
+  throw ticketNotFoundError_(ticketId);
+}
+
+function ticketNotFoundError_(ticketId) {
+  const error = new Error('Тикет ' + ticketId + ' не найден в базе.');
+  error.code = 'TICKET_NOT_FOUND';
+  return error;
+}
+
+function isTicketNotFoundError_(error) {
+  return error && error.code === 'TICKET_NOT_FOUND';
+}
+
+function getTicketRecordBySlackThread_(channelId, threadTs) {
+  const expectedThreadTs = normalizeText_(threadTs);
+  const expectedChannelId = normalizeText_(channelId);
+  const contexts = ticketSearchContextsForChannel_(expectedChannelId);
+
+  if (!expectedThreadTs) {
+    return null;
+  }
+
+  for (let contextIndex = 0; contextIndex < contexts.length; contextIndex += 1) {
+    const ticketContext = contexts[contextIndex];
+    const sheet = ensureTicketsSheet_(false, ticketContext);
+
+    if (sheet.getLastRow() < 2) {
+      continue;
+    }
+
+    const values = sheet.getDataRange().getValues();
+    const headerMap = getHeaderMap_(sheet);
+    const slackChannelColumn = headerMap['Slack Channel'] - 1;
+    const slackMessageColumn = headerMap['Slack Message TS'] - 1;
+    const slackThreadColumn = headerMap['Slack Thread TS'] - 1;
+
+    for (let rowIndex = 1; rowIndex < values.length; rowIndex += 1) {
+      const row = values[rowIndex];
+      const rowChannelId = slackChannelColumn >= 0 ? normalizeText_(row[slackChannelColumn]) : '';
+      const rowThreadTs = slackThreadColumn >= 0 ? normalizeText_(row[slackThreadColumn]) : '';
+      const rowMessageTs = slackMessageColumn >= 0 ? normalizeText_(row[slackMessageColumn]) : '';
+
+      if (expectedChannelId && rowChannelId && rowChannelId !== expectedChannelId) {
+        continue;
+      }
+
+      if (rowThreadTs === expectedThreadTs || rowMessageTs === expectedThreadTs) {
+        return {
+          sheet,
+          row: rowIndex + 1,
+          ticket: ticketFromRow_(row, headerMap, ticketContext),
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function ticketSearchContextsForChannel_(channelId) {
+  if (!channelId) {
+    return [TICKET_CONTEXTS.admin, TICKET_CONTEXTS.support];
+  }
+
+  const contexts = [];
+  const adminChannelId = normalizeText_(getProperty_(CONFIG.SLACK_TICKETS_CHANNEL_ID, ''));
+  const supportChannelId = normalizeText_(getProperty_(CONFIG.SLACK_SUPPORT_CHANNEL_ID, ''));
+
+  if (!adminChannelId || adminChannelId === channelId) {
+    contexts.push(TICKET_CONTEXTS.admin);
+  }
+
+  if (supportChannelId === channelId) {
+    contexts.push(TICKET_CONTEXTS.support);
+  }
+
+  return contexts.length ? contexts : [TICKET_CONTEXTS.admin];
+}
+
+function ticketIdFromText_(text) {
+  const match = String(text || '').match(/\b(?:TS|T)\d+\b/i);
+  return match ? match[0].toUpperCase() : '';
+}
+
+function getOrRecoverTicketRecord_(ticketId, context, payload) {
+  try {
+    return getTicketRecord_(ticketId, context);
+  } catch (error) {
+    if (!isTicketNotFoundError_(error)) {
+      throw error;
+    }
+
+    const recoveredRecord = recoverTicketRecordFromSlackPayload_(payload, ticketId, context);
+
+    if (recoveredRecord) {
+      return recoveredRecord;
+    }
+
+    throw error;
+  }
+}
+
+function getOrRecoverTicketRecordFromSlackHistory_(ticketId, context) {
+  try {
+    return getTicketRecord_(ticketId, context);
+  } catch (error) {
+    if (!isTicketNotFoundError_(error)) {
+      throw error;
+    }
+
+    const recoveredRecord = recoverTicketRecordFromSlackHistoryByTicketId_(ticketId, context);
+
+    if (recoveredRecord) {
+      return recoveredRecord;
+    }
+
+    throw new Error(
+      'Тикет ' + ticketId + ' не найден в базе и не найден в истории Slack. ' +
+      'Проверьте, что у Slack App есть scope channels:history или groups:history, бот добавлен в канал, и тикет был опубликован в Slack.'
+    );
+  }
+}
+
+function recoverTicketRecordFromSlackPayload_(payload, ticketId, context) {
+  const message = slackMessageFromActionPayload_(payload);
+  const ticket = message ? ticketFromSlackMessage_(message, context) : null;
+
+  if (!ticket || String(ticket.id) !== String(ticketId)) {
+    return null;
+  }
+
+  const record = appendTicketUnlocked_(ticket);
+  appendEvent_(ticket.id, 'Recovered', ticket.authorId || '', ticket.status, 'Recovered from Slack action payload', context);
+  return record;
+}
+
+function recoverTicketRecordFromSlackHistoryByTicketId_(ticketId, context) {
+  const ticketContext = normalizeTicketContext_(context || ticketContextFromId_(ticketId));
+  const message = findSlackTicketMessageById_(ticketId, ticketContext, daysAgo_(30));
+  const ticket = message ? ticketFromSlackMessage_(message, ticketContext) : null;
+
+  if (!ticket || normalizeText_(ticket.id).toUpperCase() !== normalizeText_(ticketId).toUpperCase()) {
+    return null;
+  }
+
+  const record = appendTicket_(ticket);
+  appendEvent_(ticket.id, 'Recovered', ticket.authorId || '', ticket.status, 'Recovered from Slack history before /over', ticketContext);
+  return record;
+}
+
+function repairMissingTicketsFromSlackSince_(since, context) {
+  const ticketContext = normalizeTicketContext_(context);
+  const startDate = asDate_(since);
+  const messages = fetchSlackChannelMessagesSince_(ticketChannelId_(ticketContext), startDate);
+  const recovered = [];
+
+  messages
+    .sort(function (left, right) {
+      return slackTsNumber_(left.ts) - slackTsNumber_(right.ts);
+    })
+    .forEach(function (message) {
+      const ticket = ticketFromSlackMessage_(message, ticketContext);
+
+      if (!ticket) {
+        return;
+      }
+
+      const record = withScriptLock_(function () {
+        try {
+          getTicketRecord_(ticket.id, ticketContext);
+          return null;
+        } catch (error) {
+          if (!isTicketNotFoundError_(error)) {
+            throw error;
+          }
+
+          return appendTicketUnlocked_(ticket);
+        }
+      });
+
+      if (!record) {
+        return;
+      }
+
+      recovered.push(ticket.id);
+      appendEvent_(ticket.id, 'Recovered', ticket.authorId || '', ticket.status, 'Recovered from Slack history message ' + message.ts, ticketContext);
+    });
+
+  primeTicketIdSequence_(ticketContext);
+
+  const result = 'Recovered ' + recovered.length + ' missing tickets since ' +
+    formatReportDateTime_(startDate) + ': ' + (recovered.length ? recovered.join(', ') : 'none');
+  console.log(result);
+  return result;
+}
+
+function fetchSlackChannelMessagesSince_(channel, since) {
+  const messages = [];
+  let cursor = '';
+
+  do {
+    const payload = {
+      channel,
+      oldest: String(Math.floor(asDate_(since).getTime() / 1000)),
+      inclusive: true,
+      limit: 200,
+    };
+
+    if (cursor) {
+      payload.cursor = cursor;
+    }
+
+    const data = slackApi_('conversations.history', payload);
+    (data.messages || []).forEach(function (message) {
+      message.channel = channel;
+      messages.push(message);
+    });
+    cursor = data.response_metadata && data.response_metadata.next_cursor || '';
+  } while (cursor);
+
+  return messages;
+}
+
+function findSlackTicketMessageById_(ticketId, context, since) {
+  const ticketContext = normalizeTicketContext_(context || ticketContextFromId_(ticketId));
+  const expectedTicketId = normalizeText_(ticketId).toUpperCase();
+  const channel = ticketChannelId_(ticketContext);
+  const oldest = String(Math.floor(asDate_(since || daysAgo_(30)).getTime() / 1000));
+  let cursor = '';
+  let pages = 0;
+  const maxPages = 20;
+
+  do {
+    const payload = {
+      channel,
+      oldest,
+      inclusive: true,
+      limit: 200,
+    };
+
+    if (cursor) {
+      payload.cursor = cursor;
+    }
+
+    const data = slackApi_('conversations.history', payload);
+    const messages = data.messages || [];
+
+    for (let index = 0; index < messages.length; index += 1) {
+      const message = messages[index];
+      message.channel = channel;
+
+      const foundTicketId = slackTicketIdFromBlocks_(slackTicketBlocks_(message)) || slackTicketIdFromText_(message.text);
+
+      if (normalizeText_(foundTicketId).toUpperCase() === expectedTicketId) {
+        return message;
+      }
+    }
+
+    cursor = data.response_metadata && data.response_metadata.next_cursor || '';
+    pages += 1;
+  } while (cursor && pages < maxPages);
+
+  return null;
+}
+
+function fetchSlackMessageByTs_(channel, ts) {
+  const data = slackApi_('conversations.history', {
+    channel,
+    oldest: String(ts),
+    latest: String(ts),
+    inclusive: true,
+    limit: 1,
+  });
+  const message = data.messages && data.messages[0];
+
+  if (!message) {
+    return null;
+  }
+
+  message.channel = channel;
+  return message;
+}
+
+function slackMessageFromActionPayload_(payload) {
+  const channel = payload && (
+    payload.channel && payload.channel.id ||
+    payload.container && payload.container.channel_id ||
+    ''
+  );
+  const ts = payload && (
+    payload.container && payload.container.message_ts ||
+    payload.message && (payload.message.thread_ts || payload.message.ts) ||
+    ''
+  );
+
+  if (payload && payload.message && (payload.message.attachments || payload.message.blocks || payload.message.text)) {
+    const message = Object.assign({}, payload.message);
+    message.channel = message.channel || channel;
+    message.ts = message.ts || ts;
+    message.thread_ts = message.thread_ts || ts;
+    return message;
+  }
+
+  if (!channel || !ts) {
+    return null;
+  }
+
+  try {
+    return fetchSlackMessageByTs_(channel, ts);
+  } catch (error) {
+    console.error(friendlyError_(error));
+    return null;
+  }
+}
+
+function ticketFromSlackMessage_(message, context) {
+  const blocks = slackTicketBlocks_(message);
+  const ticketId = slackTicketIdFromBlocks_(blocks) || slackTicketIdFromText_(message && message.text);
+
+  if (!ticketId || normalizeTicketContext_(context) !== ticketContextFromId_(ticketId)) {
+    return null;
+  }
+
+  const ticketContext = normalizeTicketContext_(context);
+  const fields = slackTicketFieldMap_(blocks);
+  const actionValue = slackTicketActionValueFromBlocks_(blocks);
+  const createdAt = slackTicketCreatedAt_(blocks, message);
+  const status = slackTicketStatus_(blocks, message);
+  const authorId = slackUserIdFromText_(slackFieldValue_(fields, ['Инициатор']));
+  const assigneeId = slackUserIdFromText_(slackFieldValue_(fields, ['Исполнитель'])) || actionValue.assigneeId || '';
+  const editedAt = slackMessageEditedAt_(message);
+  const dateAccepted = status === 'In Progress' && editedAt ? editedAt : '';
+  const dateCompleted = (status === 'Done' || status === 'Rejected') && editedAt ? editedAt : '';
+  const resolutionTime = slackDurationHours_(slackFieldValue_(fields, ['Время решения']));
+  const ticket = {
+    id: ticketId,
+    context: ticketContext,
+    createdAt,
+    authorId,
+    authorName: authorId,
+    type: isSupportContext_(ticketContext) ? SUPPORT_TICKET_TYPE : slackFieldValue_(fields, ['Тип заявки']),
+    region: slackFieldValue_(fields, ['Регион / ОП', 'Мед учреждение']),
+    priority: slackContextValue_(blocks, 'Приоритет'),
+    details: slackTicketDetails_(blocks),
+    status,
+    assigneeId,
+    assigneeName: assigneeId,
+    dateAccepted,
+    reactionTimeHours: dateAccepted ? hoursBetween_(createdAt, dateAccepted) : '',
+    dateCompleted,
+    resolutionTimeHours: resolutionTime !== '' ? resolutionTime : (dateCompleted ? hoursBetween_(dateAccepted || createdAt, dateCompleted) : ''),
+    slackChannel: message.channel || ticketChannelId_(ticketContext),
+    slackMessageTs: String(message.ts || ''),
+    slackThreadTs: String(message.thread_ts || message.ts || ''),
+    files: [],
+    filesPosted: '',
+    redactedFields: [],
+    privacyNoticeRequired: false,
+    privacyNoticeSent: '',
+    rejectionReason: slackFieldValue_(fields, ['Причина отказа']),
+    unacceptedReminderSent: '',
+    inProgressReminderSent: '',
+    responsibleNoticeSent: '',
+  };
+
+  return ticket;
+}
+
+function slackTicketBlocks_(message) {
+  const attachmentBlocks = [];
+
+  (message && message.attachments || []).forEach(function (attachment) {
+    (attachment.blocks || []).forEach(function (block) {
+      attachmentBlocks.push(block);
+    });
+  });
+
+  return attachmentBlocks.length ? attachmentBlocks : (message && message.blocks || []);
+}
+
+function slackTicketIdFromBlocks_(blocks) {
+  const headerBlocks = blocks.filter(function (block) {
+    return block.type === 'header' && block.text && block.text.text;
+  });
+
+  for (let index = 0; index < headerBlocks.length; index += 1) {
+    const ticketId = slackTicketIdFromText_(headerBlocks[index].text.text);
+
+    if (ticketId) {
+      return ticketId;
+    }
+  }
+
+  return '';
+}
+
+function slackTicketIdFromText_(text) {
+  return ticketIdFromText_(text);
+}
+
+function slackTicketStatus_(blocks, message) {
+  const statusText = blocks
+    .filter(function (block) {
+      return block.type === 'header';
+    })
+    .map(function (block) {
+      return block.text && block.text.text || '';
+    })
+    .join('\n') || message && message.text || '';
+  const lowered = statusText.toLowerCase();
+
+  if (lowered.indexOf('отклон') !== -1 || lowered.indexOf('reject') !== -1) {
+    return 'Rejected';
+  }
+
+  if (lowered.indexOf('в работе') !== -1 || lowered.indexOf('in progress') !== -1) {
+    return 'In Progress';
+  }
+
+  if (lowered.indexOf('заверш') !== -1 || lowered.indexOf('выполн') !== -1 || lowered.indexOf('done') !== -1) {
+    return 'Done';
+  }
+
+  return 'New';
+}
+
+function slackTicketFieldMap_(blocks) {
+  const map = {};
+
+  blocks.forEach(function (block) {
+    (block.fields || []).forEach(function (field) {
+      const parsed = parseSlackLabeledText_(field.text);
+
+      if (parsed.label) {
+        map[parsed.label] = parsed.value;
+      }
+    });
+  });
+
+  return map;
+}
+
+function slackContextValue_(blocks, label) {
+  for (let blockIndex = 0; blockIndex < blocks.length; blockIndex += 1) {
+    const elements = blocks[blockIndex].elements || [];
+
+    for (let elementIndex = 0; elementIndex < elements.length; elementIndex += 1) {
+      const parsed = parseSlackLabeledText_(elements[elementIndex].text);
+
+      if (parsed.label === label) {
+        return parsed.value;
+      }
+    }
+  }
+
+  return '';
+}
+
+function slackTicketDetails_(blocks) {
+  for (let index = 0; index < blocks.length; index += 1) {
+    const text = blocks[index].text && blocks[index].text.text || '';
+    const parsed = parseSlackLabeledText_(text);
+
+    if (parsed.label === 'Детали') {
+      return parsed.value;
+    }
+  }
+
+  return '';
+}
+
+function slackTicketCreatedAt_(blocks, message) {
+  const createdText = slackContextValue_(blocks, 'Создано');
+  const dateMatch = createdText.match(/<!date\^(\d+)/);
+
+  if (dateMatch) {
+    return new Date(Number(dateMatch[1]) * 1000);
+  }
+
+  return slackTsToDate_(message && message.ts);
+}
+
+function slackTicketActionValueFromBlocks_(blocks) {
+  for (let blockIndex = 0; blockIndex < blocks.length; blockIndex += 1) {
+    const elements = blocks[blockIndex].elements || [];
+
+    for (let elementIndex = 0; elementIndex < elements.length; elementIndex += 1) {
+      const value = elements[elementIndex].value;
+
+      if (value) {
+        const parsed = parseTicketActionValue_(value);
+
+        if (parsed.ticketId) {
+          return parsed;
+        }
+      }
+    }
+  }
+
+  return {
+    ticketId: '',
+    assigneeId: '',
+  };
+}
+
+function parseSlackLabeledText_(text) {
+  const match = String(text || '').match(/^\*([^*:]+):\*\s*\n?([\s\S]*)$/);
+
+  if (!match) {
+    return {
+      label: '',
+      value: '',
+    };
+  }
+
+  return {
+    label: slackUnescape_(match[1]).trim(),
+    value: slackUnescape_(match[2]).trim(),
+  };
+}
+
+function slackFieldValue_(fields, aliases) {
+  for (let index = 0; index < aliases.length; index += 1) {
+    const value = fields[aliases[index]];
+
+    if (value) {
+      return value;
+    }
+  }
+
+  return '';
+}
+
+function slackUserIdFromText_(text) {
+  const match = String(text || '').match(/<@([A-Z0-9]+)>/i);
+  return match ? match[1] : '';
+}
+
+function slackDurationHours_(value) {
+  const text = String(value || '').replace(',', '.').toLowerCase();
+  const match = text.match(/(\d+(?:\.\d+)?)/);
+
+  if (!match) {
+    return '';
+  }
+
+  const amount = Number(match[1]);
+
+  if (!Number.isFinite(amount)) {
+    return '';
+  }
+
+  if (text.indexOf('мин') !== -1) {
+    return Math.round((amount / 60) * 100) / 100;
+  }
+
+  if (text.indexOf('д') !== -1) {
+    return Math.round((amount * 24) * 100) / 100;
+  }
+
+  return amount;
+}
+
+function slackMessageEditedAt_(message) {
+  return message && message.edited && message.edited.ts ? slackTsToDate_(message.edited.ts) : '';
+}
+
+function slackTsToDate_(ts) {
+  const seconds = Math.floor(slackTsNumber_(ts));
+
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return new Date();
+  }
+
+  return new Date(seconds * 1000);
+}
+
+function slackTsNumber_(ts) {
+  return Number(String(ts || '0').split('.')[0]);
+}
+
+function slackUnescape_(value) {
+  return String(value || '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+function startOfToday_() {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+}
+
+function daysAgo_(days) {
+  const date = startOfToday_();
+  date.setDate(date.getDate() - Number(days || 0));
+  return date;
+}
+
+function parseRepairStartDate_(value) {
+  if (value instanceof Date) {
+    return value;
+  }
+
+  const text = String(value || '').trim();
+
+  if (!text) {
+    return startOfToday_();
+  }
+
+  const normalized = text.indexOf('T') === -1 ? text.replace(' ', 'T') : text;
+  return asDate_(normalized);
 }
 
 function ticketFromRow_(row, headerMap, context) {
@@ -3811,13 +4782,13 @@ function updateTicketFields_(sheet, row, fields) {
 
 function appendEvent_(ticketId, event, actor, status, notes, context) {
   const sheet = ensureEventsSheet_(false, context || ticketContextFromId_(ticketId));
-  sheet.appendRow([new Date(), ticketId, event, actor, status, notes || '']);
+  appendSheetRowUnlocked_(sheet, [new Date(), ticketId, event, actor, status, notes || '']);
 }
 
 function appendPersonalDataAudit_(ticket, action) {
   const sheet = ensurePersonalDataAuditSheet_(false, ticket.context);
 
-  sheet.appendRow([
+  appendSheetRowUnlocked_(sheet, [
     new Date(),
     ticket.id,
     ticket.authorId,
@@ -3847,7 +4818,7 @@ function outsideTaskFromSubmission_(payload, form) {
 function appendOutsideTask_(task) {
   const sheet = ensureOutsideTasksSheet_();
 
-  sheet.appendRow([
+  appendSheetRowUnlocked_(sheet, [
     task.timestamp,
     task.employeeId,
     task.employeeName,
@@ -3864,7 +4835,7 @@ function appendOutsideTask_(task) {
 function appendOutsideTaskPersonalDataAudit_(task) {
   const sheet = ensurePersonalDataAuditSheet_();
 
-  sheet.appendRow([
+  appendSheetRowUnlocked_(sheet, [
     new Date(),
     'Outside Slack',
     task.employeeId,

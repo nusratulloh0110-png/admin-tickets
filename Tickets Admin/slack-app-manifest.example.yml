@@ -12,7 +12,7 @@ features:
       should_escape: false
     - command: /support
       url: https://YOUR_WORKER_SUBDOMAIN.workers.dev
-      description: Создать тикет для лида техподдержки
+      description: Создать тикет для Tech Support Lead
       usage_hint: ""
       should_escape: false
     - command: /report
@@ -22,7 +22,7 @@ features:
       should_escape: false
     - command: /support-report
       url: https://YOUR_WORKER_SUBDOMAIN.workers.dev
-      description: Показать статистику по тикетам техподдержки
+      description: Показать статистику по тикетам Tech Support Lead
       usage_hint: "05.05.2026 06.05.2026 или @admin 05.05.2026 06.05.2026"
       should_escape: false
     - command: /add
@@ -30,6 +30,11 @@ features:
       description: Добавить выполненные вне Slack задачи
       usage_hint: ""
       should_escape: false
+    - command: /over
+      url: https://YOUR_WORKER_SUBDOMAIN.workers.dev
+      description: Закрыть тикет модератором
+      usage_hint: "@user T1147"
+      should_escape: true
   shortcuts:
     - name: Создать тикет
       type: global
@@ -41,6 +46,8 @@ oauth_config:
       - chat:write
       - commands
       - files:read
+      - channels:history
+      - groups:history
 settings:
   interactivity:
     is_enabled: true

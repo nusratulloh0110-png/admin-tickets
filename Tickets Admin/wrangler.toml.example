@@ -6,6 +6,7 @@ compatibility_date = "2026-05-06"
 APPS_SCRIPT_URL = "https://script.google.com/macros/s/YOUR_APPS_SCRIPT_DEPLOYMENT_ID/exec"
 # APPS_SCRIPT_RELAY_SECRET = "same-value-as-apps-script-RELAY_SHARED_SECRET"
 # ADMIN_USER_IDS = "U1234567890,U0987654321"
+# OVER_MODERATOR_USER_ID = "U1234567890"
 
 # Set secrets with:
 # wrangler secret put SLACK_SIGNING_SECRET

@@ -5,8 +5,9 @@
 ## Что реализовано
 
 - `/ticket` и Global Shortcut `Создать тикет` открывают Slack Modal.
-- `/support` открывает отдельную форму для задач лида техподдержки: `Мед учреждение`, `Что нужно сделать`, приоритет и фото.
+- `/support` открывает отдельную форму для задач Tech Support Lead: `Мед учреждение`, `Что нужно сделать`, приоритет и фото.
 - `/add` открывает Slack Modal для учета выполненных вне Slack задач; сохранять такие задачи могут только активные админы.
+- `/over T1147` закрывает тикет назначенным модератором, а `/over @user T1147` закрывает его на указанного исполнителя.
 - Форма содержит обязательные поля: тип заявки из справочника, регион/ОП/ID клиники, приоритет, детали, а также опциональное поле для фото.
 - После отправки бот публикует структурированную карточку тикета в `#tickets-admin` с максимально коротким ID по порядку: `T1`, `T2`, `T3`.
 - Цветная статусная полоса сохраняется, а кнопки статуса стоят сразу после блока `Детали`, чтобы они были выше `Show more / Show less`.
@@ -54,7 +55,7 @@
 | `SLACK_BOT_TOKEN` | Bot User OAuth Token, например `xoxb-...` |
 | `SLACK_TICKETS_CHANNEL_ID` | ID канала `#tickets-admin`, например `C0123456789` |
 | `SLACK_REPORT_CHANNEL_ID` | Необязательно. Канал для еженедельных отчетов. Если пусто, используется `SLACK_TICKETS_CHANNEL_ID` |
-| `SLACK_SUPPORT_CHANNEL_ID` | ID канала для тикетов лида техподдержки |
+| `SLACK_SUPPORT_CHANNEL_ID` | ID канала для тикетов Tech Support Lead |
 | `SLACK_SUPPORT_REPORT_CHANNEL_ID` | Необязательно. Канал для отчетов техподдержки. Если пусто, используется `SLACK_SUPPORT_CHANNEL_ID` |
 | `ADMIN_USER_IDS` | Необязательно. Запасной список Slack ID через запятую, если лист `Admins` пустой |
 | `SUPPORT_ADMIN_USER_IDS` | Необязательно. Запасной список Slack ID для техподдержки, если лист `Tech Support Admins` пустой |
@@ -65,6 +66,7 @@
 | `DIRECT_MODAL_OPENING` | Не заполняйте. `true` нужен только для старого прямого режима без Worker |
 | `REPORT_CUTOFF_AT` | Необязательно. Дата начала новой статистики; `setup()` заполнит автоматически, если пусто |
 | `WORKER_URL` | Рекомендуется. URL Cloudflare Worker, чтобы Apps Script заранее обновлял быстрый кэш типов заявок |
+| `OVER_MODERATOR_USER_ID` | Slack ID единственного модератора, которому разрешена команда `/over` |
 
 Если используете Worker, лучше оставить `SLACK_VERIFICATION_TOKEN` пустым и включить `RELAY_SHARED_SECRET` / `APPS_SCRIPT_RELAY_SECRET`. Slack-подпись проверяет Worker, а Apps Script принимает только запросы от relay.
 
@@ -121,6 +123,7 @@ Slack требует ответить на slash command/interactivity за 3 с
 | `SLACK_BOT_TOKEN` | Bot User OAuth Token `xoxb-...`, лучше как secret |
 | `APPS_SCRIPT_RELAY_SECRET` | Необязательно. То же значение, что `RELAY_SHARED_SECRET` в Apps Script |
 | `ADMIN_USER_IDS` | Необязательно. Slack ID админов через запятую для быстрого отказа на `/add` до открытия формы |
+| `OVER_MODERATOR_USER_ID` | Необязательно. Slack ID модератора для быстрого отказа на `/over`; Apps Script все равно проверяет свой `OVER_MODERATOR_USER_ID` |
 
 Если используете Wrangler:
 
@@ -132,7 +135,7 @@ wrangler secret put APPS_SCRIPT_RELAY_SECRET
 wrangler deploy
 ```
 
-Чтобы `/add` не открывался у не-админов еще на уровне Worker, заполните `ADMIN_USER_IDS` в `wrangler.toml` теми же Slack ID, что активны в листе `Admins`.
+Чтобы `/add` не открывался у не-админов еще на уровне Worker, заполните `ADMIN_USER_IDS` в `wrangler.toml` теми же Slack ID, что активны в листе `Admins`. Для быстрого отказа по `/over` можно заполнить `OVER_MODERATOR_USER_ID`; основная проверка все равно остается в Script Properties Apps Script.
 
 После deploy скопируйте Worker URL, например `https://tickets-admin-slack-relay.your-subdomain.workers.dev`.
 
@@ -143,6 +146,8 @@ wrangler deploy
    - `chat:write`
    - `commands`
    - `files:read`
+   - `channels:history` - только если нужно восстанавливать пропущенные строки из истории публичного канала
+   - `groups:history` - только если канал тикетов приватный
 3. Установите приложение в workspace.
 4. Пригласите бота в `#tickets-admin`.
 5. В `Slash Commands` создайте команду:
@@ -164,13 +169,18 @@ wrangler deploy
    - Command: `/add`
    - Request URL: тот же Worker URL
    - Usage hint: пусто
-10. В `Interactivity & Shortcuts` включите interactivity:
+10. В `Slash Commands` создайте команду:
+   - Command: `/over`
+   - Request URL: тот же Worker URL
+   - Usage hint: `@user T1147`
+   - Escape channels, users, and links sent to your app: включено
+11. В `Interactivity & Shortcuts` включите interactivity:
    - Request URL: тот же Worker URL
    - Options Load URL: тот же Worker URL
-11. Там же создайте Global Shortcut:
+12. Там же создайте Global Shortcut:
    - Name: `Создать тикет`
    - Callback ID: `ticket_create_shortcut`
-12. Переустановите приложение после изменения scopes, slash commands или shortcuts.
+13. Переустановите приложение после изменения scopes, slash commands или shortcuts.
 
 Если `/report` уже занята другим Slack App, Slack может отправлять команду не этому боту. В таком случае удалите старую команду у другого приложения или переименуйте команду в `slack-fast-relay-worker.js` и `slack-app-manifest.example.yml`, например на `/tickets-report`.
 
@@ -188,10 +198,21 @@ wrangler deploy
 8. Если другой админ нажмет `Выполнено` или `Отклонить`, система покажет предупреждение и не изменит статус.
 9. Если исполнитель нажимает `Отклонить`, Slack открывает окно причины отказа. Без причины отказ не применяется.
 10. Исполнитель нажимает `Выполнено`; карточка становится зеленой, в таблице заполняется `Date Completed` и `Resolution Time`.
-11. В листе `Dashboard` автоматически обновляются таблицы и графики.
-12. Пользователь не из листа `Admins` вызывает `/add` и не может сохранить вне Slack задачу; если в Worker заполнен `ADMIN_USER_IDS`, форма даже не откроется.
+11. Назначенный модератор может закрыть тикет командой `/over T1147` или `/over @user T1147`; карточка обновится, исполнитель запишется в тикет, а в тред придет сообщение, что тикет закрыт модератором.
+12. В листе `Dashboard` автоматически обновляются таблицы и графики.
+13. Пользователь не из листа `Admins` вызывает `/add` и не может сохранить вне Slack задачу; если в Worker заполнен `ADMIN_USER_IDS`, форма даже не откроется.
 
 Для техподдержки сценарий такой же, но пользователь вызывает `/support`, карточка уходит в канал `SLACK_SUPPORT_CHANNEL_ID`, ID идет отдельно как `TS1`, `TS2`, а кнопки могут нажимать только активные пользователи из `Tech Support Admins`.
+
+## Восстановление пропущенных строк
+
+Если карточки тикетов есть в Slack, но строк нет в листе `Tickets`, обновите `Code.gs`, переустановите Slack App после добавления history-scope и запустите в Apps Script одну из функций:
+
+- `repairMissingTicketsFromSlackToday()` - восстановить недостающие тикеты из сегодняшней истории `SLACK_TICKETS_CHANNEL_ID`.
+- `repairMissingTicketsFromSlackLast7Days()` - восстановить недостающие тикеты за последние 7 дней.
+- `repairMissingSupportTicketsFromSlackToday()` - то же для канала техподдержки.
+
+Функции не дублируют уже существующие `Ticket ID`; они дозаписывают только отсутствующие карточки и добавляют событие `Recovered` в `Events`.
 
 ## Аудит персональных данных
 
@@ -211,9 +232,9 @@ wrangler deploy
 - `/report @admin 05.05.2026 06.05.2026` фильтрует статистику по исполнителю тикета (`Assignee` / `Assignee Name`).
 - `/support-report 05.05.2026 06.05.2026` считает тот же период, но только по листу `Tech Support Tickets`.
 - `/support-report @admin 05.05.2026 06.05.2026` фильтрует статистику по исполнителю из `Tech Support Admins`.
-- В Slack показываются только данные по Slack-тикетам: создано, взято в работу, выполнено, отклонено, в работе сейчас, среднее время выполнения, общее время выполнения и среднее время реакции.
+- В Slack показываются данные по Slack-тикетам: создано, взято в работу, выполнено, отклонено, в работе сейчас, среднее время выполнения, общее время выполнения, среднее время реакции и краткая разбивка типов заявок по статусам.
 - Время выполнения/решения считается от момента `Взять в работу` (`Date Accepted`) до закрытия тикета (`Date Completed`), а не от момента создания заявки.
-- В Google Sheets лист `Reports` перезаписывается последним сформированным отчетом по Slack-тикетам и содержит summary-блоки, таблицы и графики.
+- В Google Sheets лист `Reports` перезаписывается последним сформированным отчетом по Slack-тикетам и содержит summary-блоки, таблицы и графики; в таблице типов заявок отдельно видны количество, выполненные, отклоненные и находящиеся в работе тикеты.
 - В отдельной Google-таблице техподдержки лист `Tech Support Reports` перезаписывается последним отчетом техподдержки; данные не попадают в основной `Reports`.
 - В Google Sheets лист `Вне Slack аналитика` перезаписывается тем же периодом отчета и показывает вне Slack задачи отдельно: итоги, сотрудников, детали и график.
 - В Google Sheets лист `Employee Report` содержит выпадающий список сотрудников из `Admins` и дату; ниже выводятся выполненные Slack-тикеты и вне Slack задачи за выбранный день.
@@ -222,13 +243,13 @@ wrangler deploy
 ## После обновления кода
 
 1. Перенесите обновленные `Code.gs` и `appsscript.json` в Apps Script.
-2. В Script Properties добавьте `WORKER_URL` со значением Worker URL, `SLACK_SUPPORT_CHANNEL_ID` и при необходимости `SLACK_SUPPORT_REPORT_CHANNEL_ID` / `SUPPORT_ADMIN_USER_IDS`. `SUPPORT_SPREADSHEET_ID` можно оставить пустым: таблица техподдержки создастся автоматически.
+2. В Script Properties добавьте `WORKER_URL` со значением Worker URL, `OVER_MODERATOR_USER_ID` со Slack ID модератора, `SLACK_SUPPORT_CHANNEL_ID` и при необходимости `SLACK_SUPPORT_REPORT_CHANNEL_ID` / `SUPPORT_ADMIN_USER_IDS`. `SUPPORT_SPREADSHEET_ID` можно оставить пустым: таблица техподдержки создастся автоматически.
 3. Запустите `setup()` еще раз. Основная таблица сохранит `Admins` / `Reports` / `Personal Data Audit` / `Вне Slack задачи` / `Вне Slack аналитика` / `Employee Report` / `Типы заявок`; в справочник добавятся колонки ответственного и текста, а в тикеты - отметка отправки уведомления. Отдельная таблица техподдержки получит `Tech Support Tickets` / `Tech Support Events` / `Tech Support Admins` / `Tech Support Reports` / `Tech Support Dashboard` / `Personal Data Audit`.
 4. При первом запуске обновления `setup()` перенесет уже существующие вкладки `Tech Support ...` из основной таблицы в отдельную таблицу и перенесет туда строки аудита тикетов `TS...`. Ссылка на обе таблицы возвращается результатом функции `setup()`.
 5. Обновите deployment Web App.
 6. Задеплойте `slack-fast-relay-worker.js`.
-7. В Slack App добавьте scope `files:read` и переустановите приложение в workspace.
-8. В Slack App добавьте slash commands `/support`, `/support-report`, `/add` и замените Request URL для `/ticket`, `/support`, `/add`, `/report`, `/support-report`, Interactivity Request URL и Options Load URL на Worker URL.
+7. В Slack App добавьте scope `files:read`; для восстановления пропущенных строк добавьте также `channels:history` или `groups:history`. После изменения scopes переустановите приложение в workspace.
+8. В Slack App добавьте slash commands `/support`, `/support-report`, `/add`, `/over` и замените Request URL для `/ticket`, `/support`, `/add`, `/over`, `/report`, `/support-report`, Interactivity Request URL и Options Load URL на Worker URL.
 
 Если в Executions всё еще появляется `doPost` длительностью больше 3 секунд при `/ticket`, значит Slack всё еще отправляет `/ticket` прямо в Apps Script. В `Slash Commands` и `Interactivity & Shortcuts` должен стоять Worker URL, а не `script.google.com`.
 

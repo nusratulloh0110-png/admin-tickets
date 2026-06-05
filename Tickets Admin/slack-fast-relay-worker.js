@@ -13,6 +13,7 @@
  * Optional:
  * - APPS_SCRIPT_RELAY_SECRET
  * - ADMIN_USER_IDS: comma/space-separated Slack user IDs allowed to use /add before the modal opens
+ * - OVER_MODERATOR_USER_ID: optional fast check for the single Slack user ID allowed to use /over
  */
 
 const CALLBACKS = {
@@ -96,7 +97,7 @@ export default {
 
         return jsonResponse_({
           response_type: 'ephemeral',
-          text: 'Открываю форму создания тикета техподдержки.',
+          text: 'Открываю форму создания тикета Tech Support Lead.',
         });
       }
 
@@ -132,7 +133,7 @@ export default {
 
         return jsonResponse_({
           response_type: 'ephemeral',
-          text: 'Готовлю отчет техподдержки. Он появится здесь через несколько секунд.',
+          text: 'Готовлю отчет Tech Support Lead. Он появится здесь через несколько секунд.',
         });
       }
 
@@ -152,9 +153,35 @@ export default {
         });
       }
 
+      if (slackRequest.command === '/over') {
+        if (env.OVER_MODERATOR_USER_ID && !isOverModerator_(slackRequest.userId, env.OVER_MODERATOR_USER_ID)) {
+          return jsonResponse_({
+            response_type: 'ephemeral',
+            text: 'У вас нет прав на /over.',
+          });
+        }
+
+        ctx.waitUntil(forwardToAppsScript_(env, {
+          type: 'over_command',
+          token: slackRequest.token,
+          command: slackRequest.command,
+          text: slackRequest.text,
+          user_id: slackRequest.userId,
+          user_name: slackRequest.userName,
+          channel_id: slackRequest.channelId,
+          response_url: slackRequest.responseUrl,
+          thread_ts: slackRequest.threadTs,
+        }));
+
+        return jsonResponse_({
+          response_type: 'ephemeral',
+          text: 'Проверяю тикет и права модератора.',
+        });
+      }
+
       return jsonResponse_({
         response_type: 'ephemeral',
-        text: 'Эта автоматизация обрабатывает команды /ticket, /support, /add, /report и /support-report.',
+        text: 'Эта автоматизация обрабатывает команды /ticket, /support, /add, /over, /report и /support-report.',
       });
     }
 
@@ -227,6 +254,7 @@ function parseSlackRequest_(rawBody) {
     channelId: params.get('channel_id') || '',
     responseUrl: params.get('response_url') || '',
     text: params.get('text') || '',
+    threadTs: params.get('thread_ts') || '',
   };
 }
 
@@ -292,6 +320,10 @@ function isAdmin_(userId, adminUserIds) {
   }
 
   return allowedIds.includes(String(userId || '').trim().toUpperCase());
+}
+
+function isOverModerator_(userId, moderatorUserId) {
+  return String(userId || '').trim().toUpperCase() === String(moderatorUserId || '').trim().toUpperCase();
 }
 
 function outsideTaskAccessDeniedText_() {
@@ -860,7 +892,7 @@ function buildSupportTicketModal_() {
     }),
     title: {
       type: 'plain_text',
-      text: 'Задача техподдержки',
+      text: 'Задача Tech Support Lead',
     },
     submit: {
       type: 'plain_text',
